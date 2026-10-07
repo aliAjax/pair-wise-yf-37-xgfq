@@ -54,6 +54,26 @@ class SQLiteRepository:
                     created_at TEXT NOT NULL,
                     PRIMARY KEY(actor_id, idem_key)
                 );
+                CREATE TABLE IF NOT EXISTS merge_batches (
+                    batch_id TEXT PRIMARY KEY,
+                    actor_id TEXT NOT NULL,
+                    item_count INTEGER NOT NULL,
+                    merged_count INTEGER NOT NULL DEFAULT 0,
+                    duplicate_count INTEGER NOT NULL DEFAULT 0,
+                    error_count INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS merge_batch_items (
+                    batch_id TEXT NOT NULL,
+                    client_id TEXT NOT NULL,
+                    entity_id TEXT,
+                    status TEXT NOT NULL,
+                    detail TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY(batch_id, client_id)
+                );
             """)
 
     @staticmethod
@@ -195,6 +215,77 @@ class SQLiteRepository:
                 "VALUES (?, ?, ?, ?)",
                 (actor_id, idem_key, entity_id, utcnow()),
             )
+
+    def upsert_merge_batch(self, batch_id, actor_id, item_count):
+        now = utcnow()
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT INTO merge_batches(batch_id, actor_id, item_count, merged_count, duplicate_count, error_count, status, created_at, updated_at) "
+                "VALUES (?, ?, ?, 0, 0, 0, 'in_progress', ?, ?) "
+                "ON CONFLICT(batch_id) DO UPDATE SET item_count = excluded.item_count, updated_at = excluded.updated_at",
+                (batch_id, actor_id, item_count, now, now),
+            )
+
+    def record_merge_item(self, batch_id, client_id, entity_id, status, detail):
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT INTO merge_batch_items(batch_id, client_id, entity_id, status, detail, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(batch_id, client_id) DO UPDATE SET "
+                "entity_id = excluded.entity_id, status = excluded.status, detail = excluded.detail",
+                (
+                    batch_id,
+                    client_id,
+                    entity_id,
+                    status,
+                    json.dumps(detail or {}, ensure_ascii=False, sort_keys=True),
+                    utcnow(),
+                ),
+            )
+
+    def finish_merge_batch(self, batch_id, merged, duplicates, errors):
+        now = utcnow()
+        status = "completed" if errors == 0 else "completed_with_errors"
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE merge_batches SET merged_count = ?, duplicate_count = ?, error_count = ?, "
+                "status = ?, updated_at = ? WHERE batch_id = ?",
+                (merged, duplicates, errors, status, now, batch_id),
+            )
+
+    def get_merge_batch(self, batch_id):
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM merge_batches WHERE batch_id = ?", (batch_id,)
+            ).fetchone()
+        if not row:
+            return None
+        with self._connect() as connection:
+            items = connection.execute(
+                "SELECT * FROM merge_batch_items WHERE batch_id = ? ORDER BY client_id",
+                (batch_id,),
+            ).fetchall()
+        return {
+            "batch_id": row["batch_id"],
+            "actor_id": row["actor_id"],
+            "item_count": row["item_count"],
+            "merged_count": row["merged_count"],
+            "duplicate_count": row["duplicate_count"],
+            "error_count": row["error_count"],
+            "status": row["status"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+            "items": [
+                {
+                    "client_id": item["client_id"],
+                    "entity_id": item["entity_id"],
+                    "status": item["status"],
+                    "detail": json.loads(item["detail"]),
+                    "created_at": item["created_at"],
+                }
+                for item in items
+            ],
+        }
 
     def ping(self):
         with self._connect() as connection:

@@ -87,6 +87,8 @@ def create_handler(service, rules, static_dir):
                     return self._send(200, {"items": service.audit_log()})
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
                     return self._send(200, service.get(parts[2]))
+                if len(parts) == 3 and parts[:2] == ["api", "merge"]:
+                    return self._send(200, service.get_merge_batch(parts[2]))
                 if len(parts) >= 2 and parts[0] == "api":
                     if parts[1] == "entities":
                         raise NotFoundError("not found")
@@ -144,6 +146,16 @@ def create_handler(service, rules, static_dir):
                     return self._send(
                         201,
                         service.create(actor, parts[1], body, idem),
+                    )
+                if len(parts) == 3 and parts[:2] == ["api", "merge"] and parts[2] == "contacts":
+                    body = self._body()
+                    return self._send(
+                        200,
+                        service.merge_contacts(
+                            actor,
+                            body.get("batch_id"),
+                            body.get("contacts", []),
+                        ),
                     )
                 raise NotFoundError("not found")
             except Exception as exc:
