@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 from .domain import (
     ConflictError,
@@ -7,9 +7,55 @@ from .domain import (
     ValidationError,
 )
 
+# ---------------------------------------------------------------------------
+# Follow-up window rules (接触者随访窗口)
+#
+# A close contact's follow-up window starts at the later of the case onset
+# date and the contact's last exposure date, and runs for an observation
+# period (default 14 days, configurable per disease). Day one is the window
+# start, so the window end is start + (observation_days - 1).
+#
+# Statuses:
+#   PENDING     - before the window starts
+#   ACTIVE      - inside the window (window is inclusive on both ends)
+#   COMPLETED   - after the window ends
+#   NEEDS_REVIEW- window cannot be computed from the data on record; the
+#                 contact is flagged for a human epidemiologist to review
+# ---------------------------------------------------------------------------
 
-def _date_ordinal(value):
-    return datetime.fromisoformat(str(value)[:10]).date().toordinal()
+FOLLOWUP_PENDING = "pending"
+FOLLOWUP_ACTIVE = "active"
+FOLLOWUP_COMPLETED = "completed"
+FOLLOWUP_NEEDS_REVIEW = "needs_review"
+
+FOLLOWUP_STATUSES = (
+    FOLLOWUP_PENDING,
+    FOLLOWUP_ACTIVE,
+    FOLLOWUP_COMPLETED,
+    FOLLOWUP_NEEDS_REVIEW,
+)
+
+DEFAULT_OBSERVATION_DAYS = 14
+# Contacts still in the window, not yet inside it, or un-computable all block
+# case closure. Only a clean "completed" set lets the case close.
+CLOSE_BLOCKING_STATUSES = (
+    FOLLOWUP_ACTIVE,
+    FOLLOWUP_PENDING,
+    FOLLOWUP_NEEDS_REVIEW,
+)
+
+
+def parse_epi_date(value):
+    """Parse an ISO date (YYYY-MM-DD); return None for blank/garbage input."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text[:10]).date()
+    except ValueError:
+        return None
 
 
 def _validate_case(actor, data, lookup):
@@ -116,6 +162,91 @@ class RuleEngine:
         return next_status, patch
 
 
+def observation_days_for(case_data, policies=None):
+    """Observation period length: disease policy first, then case override, then default."""
+    if policies:
+        disease = (case_data or {}).get("disease")
+        if disease and disease in policies:
+            return int(policies[disease])
+    override = (case_data or {}).get("observation_days")
+    if override:
+        return int(override)
+    return DEFAULT_OBSERVATION_DAYS
+
+
+def compute_followup(case_data, contact_data, as_of, policies=None):
+    """Compute a contact's follow-up window and status from source data.
+
+    Returns a dict with followup_start/followup_end (ISO strings or None),
+    followup_status and review_reasons (list, non-empty only for needs_review).
+    Pure function: raises nothing, marks un-computable inputs for review.
+    """
+    reasons = []
+    onset = parse_epi_date((case_data or {}).get("onset_date"))
+    if onset is None:
+        reasons.append("missing_or_invalid_case_onset_date")
+
+    exposure_start = parse_epi_date((contact_data or {}).get("exposure_start"))
+    exposure_end = parse_epi_date((contact_data or {}).get("exposure_end"))
+    if exposure_start is None:
+        reasons.append("missing_or_invalid_exposure_date")
+    last_exposure = exposure_end or exposure_start
+
+    days = observation_days_for(case_data, policies)
+    if days <= 0:
+        reasons.append("invalid_observation_days")
+
+    if reasons:
+        return {
+            "followup_start": None,
+            "followup_end": None,
+            "followup_status": FOLLOWUP_NEEDS_REVIEW,
+            "review_reasons": reasons,
+        }
+
+    window_start = max(onset, last_exposure)
+    window_end = window_start + timedelta(days=days - 1)
+    today = as_of if isinstance(as_of, date) else parse_epi_date(as_of)
+
+    if today is None:
+        status = FOLLOWUP_NEEDS_REVIEW
+        reasons.append("missing_reference_date")
+    elif today < window_start:
+        status = FOLLOWUP_PENDING
+    elif today <= window_end:
+        status = FOLLOWUP_ACTIVE
+    else:
+        status = FOLLOWUP_COMPLETED
+
+    return {
+        "followup_start": window_start.isoformat(),
+        "followup_end": window_end.isoformat(),
+        "followup_status": status,
+        "review_reasons": reasons,
+    }
+
+
+def case_close_blockers(case_data, contacts, as_of, policies=None):
+    """Return contacts that prevent closing the case.
+
+    Every contact is recomputed against the current case data (never trusting
+    stored follow-up fields). The case and the contacts therefore cannot tell
+    different stories: closure and contact windows always agree.
+    """
+    blockers = []
+    for contact in contacts:
+        result = compute_followup(case_data, contact["data"], as_of, policies)
+        if result["followup_status"] in CLOSE_BLOCKING_STATUSES:
+            blockers.append({
+                "contact_id": contact["id"],
+                "person_id": contact["data"].get("person_id"),
+                "followup_status": result["followup_status"],
+                "followup_end": result["followup_end"],
+                "review_reasons": result["review_reasons"],
+            })
+    return blockers
+
+
 def _find_one(lookup, kind, field, value):
     if lookup is None:
         return None
@@ -124,4 +255,7 @@ def _find_one(lookup, kind, field, value):
 
 
 def _date_ordinal(value):
-    return datetime.fromisoformat(str(value)[:10]).date().toordinal()
+    parsed = parse_epi_date(value)
+    if parsed is None:
+        raise ValueError("invalid date: %r" % value)
+    return parsed.toordinal()

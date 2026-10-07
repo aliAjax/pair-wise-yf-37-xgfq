@@ -27,6 +27,18 @@ class InvalidTransition(DomainError):
     """The requested state transition is not valid."""
 
 
+class BatchMergeError(DomainError):
+    """A batch merge stopped before all pending items were applied.
+
+    Applied items stay applied; resubmitting the same batch id resumes from
+    the first pending item. ``report`` carries the progress so far.
+    """
+
+    def __init__(self, message, report=None):
+        super().__init__(message)
+        self.report = report or {}
+
+
 class Role(str, Enum):
     viewer = "viewer"
     admin = "admin"

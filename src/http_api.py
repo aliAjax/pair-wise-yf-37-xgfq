@@ -12,6 +12,7 @@ from .domain import (
     PermissionDenied,
     ValidationError,
     Actor,
+    BatchMergeError,
 )
 
 
@@ -67,11 +68,18 @@ def create_handler(service, rules, static_dir):
                 status = 409
             elif isinstance(exc, ValidationError):
                 status = 400
+            elif isinstance(exc, BatchMergeError):
+                # Some items landed; client retries the SAME batch_id.
+                status = 202
             elif isinstance(exc, DomainError):
                 status = 400
             else:
                 status = 500
-            self._send(status, {"error": str(exc), "type": type(exc).__name__})
+            payload = {"error": str(exc), "type": type(exc).__name__}
+            report = getattr(exc, "report", None)
+            if report:
+                payload["partial"] = report
+            self._send(status, payload)
 
         def do_GET(self):
             try:
@@ -85,6 +93,19 @@ def create_handler(service, rules, static_dir):
                         return self._send_html(200, handle.read())
                 if parts == ["api", "audit"]:
                     return self._send(200, {"items": service.audit_log()})
+                # GET /api/batches/<batch_id> - batch ledger / retry status
+                if len(parts) == 3 and parts[:2] == ["api", "batches"]:
+                    return self._send(200, service.get_batch_status(parts[2]))
+                # GET /api/cases/<id>/contacts | .../consistency
+                if len(parts) == 4 and parts[:2] == ["api", "cases"]:
+                    if parts[3] == "contacts":
+                        return self._send(
+                            200, {"items": service.list_contacts(parts[2])}
+                        )
+                    if parts[3] == "consistency":
+                        return self._send(
+                            200, service.consistency_report(parts[2])
+                        )
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
                     return self._send(200, service.get(parts[2]))
                 if len(parts) >= 2 and parts[0] == "api":
@@ -137,6 +158,22 @@ def create_handler(service, rules, static_dir):
                     return self._send(
                         200,
                         service.transition(actor, parts[2], parts[3], self._body(), None),
+                    )
+                # POST /api/batches/merge - offline batch resumption
+                if parts == ["api", "batches", "merge"]:
+                    return self._send(200, service.merge_batch(actor, self._body()))
+                # POST /api/cases/<id>/onset {"onset_date": "..."}
+                if (len(parts) == 4 and parts[:2] == ["api", "cases"]
+                        and parts[3] == "onset"):
+                    body = self._body()
+                    return self._send(
+                        200,
+                        service.update_onset_date(
+                            actor,
+                            parts[2],
+                            body.get("onset_date"),
+                            body.get("expected_version"),
+                        ),
                     )
                 if len(parts) == 2 and parts[0] == "api":
                     body = self._body()
